@@ -1,16 +1,31 @@
-from fastmcp import FastMCP
-import os
-import sqlite3
+from __future__ import annotations
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "expenses.db")
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
+import sqlite3
+from pathlib import Path
+
+from fastmcp import FastMCP
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "expenses.db"
+CATEGORIES_PATH = BASE_DIR / "categories.json"
 
 mcp = FastMCP("ExpenseTracker")
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS expenses(
+
+def get_connection() -> sqlite3.Connection:
+    """Create a connection to the local SQLite database."""
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_db() -> None:
+    """Create the expenses table if it does not already exist."""
+    with get_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT NOT NULL,
                 amount REAL NOT NULL,
@@ -18,109 +33,218 @@ def init_db():
                 subcategory TEXT DEFAULT '',
                 note TEXT DEFAULT ''
             )
-        """)
+            """
+        )
+
 
 init_db()
 
-@mcp.tool()
-def add_expense(date, amount, category, subcategory="", note=""):
-    '''Add a new expense entry to the database.'''
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
-            "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-            (date, amount, category, subcategory, note)
-        )
-        return {"status": "ok", "id": cur.lastrowid}
-    
-@mcp.tool()
-def list_expenses(start_date, end_date):
-    '''List expense entries within an inclusive date range.'''
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+
+@mcp.tool
+def add_expense(
+    date: str,
+    amount: float,
+    category: str,
+    subcategory: str = "",
+    note: str = "",
+) -> dict:
+    """Add a new expense entry."""
+    with get_connection() as connection:
+        cursor = connection.execute(
             """
-            SELECT id, date, amount, category, subcategory, note
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            ORDER BY id ASC
+            INSERT INTO expenses (
+                date, amount, category, subcategory, note
+            )
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (start_date, end_date)
+            (date, amount, category, subcategory, note),
         )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-@mcp.tool()
-def summarize(start_date, end_date, category=None):
-    '''Summarize expenses by category within an inclusive date range.'''
-    with sqlite3.connect(DB_PATH) as c:
-        query = (
+        return {
+            "status": "ok",
+            "id": cursor.lastrowid,
+        }
+
+
+@mcp.tool
+def list_expenses(
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    """List expenses within an inclusive date range."""
+    with get_connection() as connection:
+        rows = connection.execute(
             """
-            SELECT category, SUM(amount) AS total_amount
+            SELECT
+                id,
+                date,
+                amount,
+                category,
+                subcategory,
+                note
             FROM expenses
             WHERE date BETWEEN ? AND ?
-            """
-        )
-        params = [start_date, end_date]
+            ORDER BY date ASC, id ASC
+            """,
+            (start_date, end_date),
+        ).fetchall()
 
-        if category:
-            query += " AND category = ?"
-            params.append(category)
+        return [dict(row) for row in rows]
 
-        query += " GROUP BY category ORDER BY category ASC"
 
-        cur = c.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+@mcp.tool
+def summarize(
+    start_date: str,
+    end_date: str,
+    category: str | None = None,
+) -> list[dict]:
+    """Summarize expenses by category within an inclusive date range."""
 
-@mcp.tool()
-def update_expense(id, date=None, amount=None, category=None, subcategory=None, note=None):
-    '''Update fields of an existing expense entry. Only provided fields are changed.'''
-    fields, values = [], []
-    for col, val in [("date", date), ("amount", amount), ("category", category),
-                      ("subcategory", subcategory), ("note", note)]:
-        if val is not None:
-            fields.append(f"{col} = ?")
-            values.append(val)
+    query = """
+        SELECT
+            category,
+            SUM(amount) AS total_amount
+        FROM expenses
+        WHERE date BETWEEN ? AND ?
+    """
+
+    params: list[str] = [start_date, end_date]
+
+    if category is not None:
+        query += " AND category = ?"
+        params.append(category)
+
+    query += """
+        GROUP BY category
+        ORDER BY category ASC
+    """
+
+    with get_connection() as connection:
+        rows = connection.execute(query, params).fetchall()
+
+        return [dict(row) for row in rows]
+
+
+@mcp.tool
+def update_expense(
+    id: int,
+    date: str | None = None,
+    amount: float | None = None,
+    category: str | None = None,
+    subcategory: str | None = None,
+    note: str | None = None,
+) -> dict:
+    """Update only the provided fields of an existing expense."""
+
+    fields: list[str] = []
+    values: list[object] = []
+
+    updates = {
+        "date": date,
+        "amount": amount,
+        "category": category,
+        "subcategory": subcategory,
+        "note": note,
+    }
+
+    for column, value in updates.items():
+        if value is not None:
+            fields.append(f"{column} = ?")
+            values.append(value)
+
     if not fields:
-        return {"status": "error", "message": "No fields provided to update"}
+        return {
+            "status": "error",
+            "message": "No fields provided to update",
+        }
+
     values.append(id)
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(f"UPDATE expenses SET {', '.join(fields)} WHERE id = ?", values)
-        if cur.rowcount == 0:
-            return {"status": "error", "message": f"No expense with id {id}"}
-        return {"status": "ok", "updated_id": id}
 
-@mcp.tool()
-def delete_expense(id):
-    '''Delete an expense entry by id.'''
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute("DELETE FROM expenses WHERE id = ?", (id,))
-        if cur.rowcount == 0:
-            return {"status": "error", "message": f"No expense with id {id}"}
-        return {"status": "ok", "deleted_id": id}
+    query = f"""
+        UPDATE expenses
+        SET {", ".join(fields)}
+        WHERE id = ?
+    """
 
-@mcp.tool()
-def search_expenses(query, limit=50):
-    '''Search expenses by keyword in category, subcategory, or note.'''
+    with get_connection() as connection:
+        cursor = connection.execute(query, values)
+
+        if cursor.rowcount == 0:
+            return {
+                "status": "error",
+                "message": f"No expense with id {id}",
+            }
+
+        return {
+            "status": "ok",
+            "updated_id": id,
+        }
+
+
+@mcp.tool
+def delete_expense(id: int) -> dict:
+    """Delete an expense entry by ID."""
+
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "DELETE FROM expenses WHERE id = ?",
+            (id,),
+        )
+
+        if cursor.rowcount == 0:
+            return {
+                "status": "error",
+                "message": f"No expense with id {id}",
+            }
+
+        return {
+            "status": "ok",
+            "deleted_id": id,
+        }
+
+
+@mcp.tool
+def search_expenses(
+    query: str,
+    limit: int = 50,
+) -> list[dict]:
+    """Search expenses by category, subcategory, or note."""
+
+    if limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500")
+
     like = f"%{query}%"
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+
+    with get_connection() as connection:
+        rows = connection.execute(
             """
-            SELECT id, date, amount, category, subcategory, note
+            SELECT
+                id,
+                date,
+                amount,
+                category,
+                subcategory,
+                note
             FROM expenses
-            WHERE category LIKE ? OR subcategory LIKE ? OR note LIKE ?
-            ORDER BY date DESC
+            WHERE category LIKE ?
+               OR subcategory LIKE ?
+               OR note LIKE ?
+            ORDER BY date DESC, id DESC
             LIMIT ?
             """,
-            (like, like, like, limit)
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+            (like, like, like, limit),
+        ).fetchall()
 
-@mcp.resource("expense://categories", mime_type="application/json")
-def categories():
-    # Read fresh each time so you can edit the file without restarting
-    with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-        return f.read()
+        return [dict(row) for row in rows]
+
+
+@mcp.resource("expense://categories")
+def categories() -> str:
+    """Return available expense categories as JSON."""
+
+    with CATEGORIES_PATH.open("r", encoding="utf-8") as file:
+        return file.read()
+
 
 if __name__ == "__main__":
     mcp.run()
